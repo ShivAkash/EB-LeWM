@@ -1,23 +1,202 @@
+# LeWM: Event-Bottleneck Sub-Goal Planning with Termination Gating
 
-# LeWorldModel
-### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
+This repository extends the upstream **LeWorldModel (LeWM)** codebase with **Event-Bottleneck sub-goal planning** for frozen world-model backbones. It accompanies the publication:
 
-[Lucas Maes*](https://x.com/lucasmaes_), [Quentin Le Lidec*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/)
+> Event-Bottleneck Sub-Goal Planning with Termination Gating for Latent World Models (LeWM)
 
-**Abstract:** Joint Embedding Predictive Architectures (JEPAs) offer a compelling framework for learning world models in compact latent spaces, yet existing methods remain fragile, relying on complex multi-term losses, exponential moving averages, pretrained encoders, or auxiliary supervision to avoid representation collapse. In this work, we introduce LeWorldModel (LeWM), the first JEPA that trains stably end-to-end from raw pixels using only two loss terms: a next-embedding prediction loss and a regularizer enforcing Gaussian-distributed latent embeddings. This reduces tunable loss hyperparameters from six to one compared to the only existing end-to-end alternative. With ~15M parameters trainable on a single GPU in a few hours, LeWM plans up to 48× faster than foundation-model-based world models while remaining competitive across diverse 2D and 3D control tasks. Beyond control, we show that LeWM's latent space encodes meaningful physical structure through probing of physical quantities. Surprise evaluation confirms that the model reliably detects physically implausible events.
+The upstream LeWM implementation and pretrained models are preserved in this repository. We thank the original authors and maintain attribution to the upstream project throughout.
 
-<p align="center">
-   <b>[ <a href="https://arxiv.org/pdf/2603.19312v1">Paper</a> | <a href="https://huggingface.co/collections/quentinll/lewm">Checkpoints &amp; Data</a> | <a href="https://le-wm.github.io/">Website</a> ]</b>
-</p>
+## Overview and key contributions
 
-<br>
+The method adds four tightly scoped mechanisms while keeping the LeWM backbone frozen:
 
-<p align="center">
-  <img src="assets/lewm.gif" width="80%">
-</p>
+- a temporal-distance head for latent goal and sub-goal costs;
+- a peak-latent-velocity bottleneck head that predicts an event-aligned sub-goal;
+- a plan-time termination handoff gate that decides whether rollout cost should be handed to the sub-goal or final goal; and
+- an optional runtime plan flush that replans when the latent termination probability changes.
 
-If you find this code useful, please reference it in your paper:
+The rollout cost combines terminal temporal distance with minimum-over-horizon distance and a termination bonus. Fixed-\(k\) and no-gate variants isolate whether event-aligned generation or fixed replanning explains performance.
+
+**Epistemic LoRA pruning:** an epistemic LoRA branch was tested on TwoRoom. It was inert: EB-JeWM and EB-JeWM no-prune both reached \(98.8\%\) success, and the paired exact McNemar test gave \(p=1.0\). The branch was removed from the released method.
+
+## Repository map
+
+```text
+le-wm/
+├── README.md
+├── REPRODUCIBILITY.md
+├── LICENSE
+├── .gitignore
+├── requirements-eb.txt
+├── eb_planner.py                  # EB heads, criterion, policy wrapper
+├── train_eb_heads.py              # frozen-backbone head training/calibration
+├── eval.py / train.py / jepa.py   # upstream LeWM evaluation and training
+├── module.py / utils.py
+├── config/ / assets/
+├── benchmark-protocol/
+│   └── compare_runs.py            # Wilson, paired bootstrap, exact McNemar
+├── scripts/                       # content-named frozen experiment protocols
+├── analysis/
+│   ├── check_*_events.py          # physical event-alignment checks
+│   ├── diagnose_tworoom_failures.py
+│   ├── summarize_overhead.py
+│   └── generate_figures.py
+├── results/
+│   ├── all_benchmarks_summary.txt
+│   └── environment_manifest.txt
+└── logs/                          # local raw logs; gitignored
 ```
+
+Preserved upstream root files are intentionally kept at the repository root for Hydra and import compatibility.
+
+## Environment and data setup
+
+Create Python 3.10 environment:
+
+```bash
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-eb.txt
+python -m pip install "stable-worldmodel[train,env]"
+```
+
+The release manifest is [results/environment_manifest.txt](results/environment_manifest.txt). The recorded image stack uses EGL/MuJoCo. Set `MUJOCO_GL=egl` for evaluation. CUDA is optional for the code but hardware numbers were collected on a configured GPU environment.
+
+Download each official LeWM checkpoint with the Hugging Face CLI:
+
+```bash
+huggingface-cli download quentinll/lewm-tworooms --include "weights.pt" "config.json" --local-dir ~/.stable_worldmodel/tworoom_lewm
+huggingface-cli download quentinll/lewm-pusht --include "weights.pt" "config.json" --local-dir ~/.stable_worldmodel/pusht_lewm
+huggingface-cli download quentinll/lewm-cube --include "weights.pt" "config.json" --local-dir ~/.stable_worldmodel/cube_lewm
+huggingface-cli download quentinll/lewm-reacher --include "weights.pt" "config.json" --local-dir ~/.stable_worldmodel/reacher_lewm
+```
+
+Place official HDF5 datasets in `~/.stable_worldmodel/datasets/`:
+
+```text
+tworoom.h5
+pusht_expert_train.h5
+cube_single_expert.h5
+reacher.h5
+```
+
+Dataset names in Hydra are the filenames without `.h5`.
+
+## Step-by-step replication
+
+1. **Verify physical event alignment**
+
+```bash
+python analysis/check_tworoom_events.py --policy tworoom_lewm/weights.pt
+python analysis/check_pusht_events.py --policy pusht_lewm/weights.pt
+python analysis/check_cube_events.py --policy cube_lewm/weights.pt
+```
+
+2. **Train and calibrate EB heads**
+
+```bash
+python train_eb_heads.py --policy tworoom_lewm/weights.pt --dataset tworoom \
+  --num_train_episodes 300 --num_val_episodes 50 \
+  --cem_horizon 25 --fixed_k 25 --max_horizon 75 \
+  --steps 2500 --seed 0 --out ~/.stable_worldmodel/tworoom_lewm/eb_heads_final.pt
+```
+
+Episodes with `ep >= 2000` are training, `1000..1999` validation, and `ep < 1000` held-out test. `--cem_horizon` controls far-mask and `tau_far`; `--fixed_k` only targets the fixed-\(k\) ablation. This decoupling prevents k-sweeps from changing event-gate geometry.
+
+3. **Run frozen protocols**
+
+```bash
+bash scripts/run_tworoom_primary_b90.sh
+bash scripts/run_tworoom_ablations_budgets.sh
+bash scripts/run_tworoom_unbundle_ksweep.sh
+bash scripts/run_tworoom_sameckpt_k10.sh
+bash scripts/run_pusht_o50_b100.sh
+bash scripts/run_cube_o50_b100.sh
+bash scripts/run_reacher_o50_b100.sh
+```
+
+Every script supports `DRY=1` to print commands without executing:
+
+```bash
+DRY=1 bash scripts/run_tworoom_primary_b90.sh
+```
+
+Output variables include `CKPT`, `OUT`, `HEADS`, `SEEDS`, `OFFSET`, `BUDGET`, and `DRY` where applicable.
+
+4. **Paired evaluation and diagnostics**
+
+```bash
+python benchmark-protocol/compare_runs.py BASE.txt OURS.txt
+python analysis/diagnose_tworoom_failures.py BASE.txt
+python analysis/summarize_overhead.py ~/.stable_worldmodel/tworoom_lewm/*.txt
+```
+
+`compare_runs.py` reports Wilson 95% confidence intervals, paired episode bootstrap 95% intervals, and exact McNemar tests.
+
+## Complete results summary
+
+All values below are extracted from the retained protocol summaries/logs. See [results/all_benchmarks_summary.txt](results/all_benchmarks_summary.txt) for the compact table.
+
+### TwoRoom primary and budget scaling
+
+| Arm | b=90 | b=70 | b=60 |
+|---|---:|---:|---:|
+| vanilla | 26.0±6.6 | — | — |
+| temporal distance | 93.2±3.1 | 91.6±3.7 | 91.0±4.0 |
+| fixed-k EB-JeWM | 98.4±2.0 | 98.6±1.8 | 96.8±2.2 |
+| EB-JeWM | 98.8±1.3 | 98.6±1.3 | 97.8±1.7 |
+| no termination | 88.8±3.8 | 83.6±4.8 | 78.0±5.1 |
+
+At b=90, EB-JeWM versus fixed-k had a paired difference of `+0.4` points, bootstrap 95% `[-0.8,+1.6]`, and exact McNemar `p=0.754`.
+
+### TwoRoom termination unbundling
+
+| Arm | Success |
+|---|---:|
+| noterm | 81.8±6.4 |
+| costonly | 94.2±2.1 |
+| noflush | 96.6±1.8 |
+| nobonus | 97.4±1.8 |
+| EB-JeWM | 98.2±1.9 |
+
+No numeric Same-Room/Cross-Room breakdown was retained in this checkout. The diagnostic tool classifies held-out episodes using the true environment wall and should be rerun on fresh result files.
+
+### Unconfounded fixed-k sweep
+
+| k | Fixed-k | EB-JeWM |
+|---:|---:|---:|
+| 10 | 91.2±3.1 | 98.8±1.3 |
+| 25 | 98.6±1.8 at b=70 | 98.6±1.3 |
+| 40 | 97.8±1.7 | 98.2±1.9 |
+
+The same-checkpoint k=10 control is implemented for Seeds 400-409 in `scripts/run_tworoom_sameckpt_k10.sh`. Historical table entries: EB-JeWM k=10 \(97.4\pm2.5\%\), fixed-k \(91.2\pm4.5\%\); a raw reproducibility log was not present.
+
+### Cross-benchmark generalization
+
+| Benchmark | Vanilla | Temp-dist min | EB-JeWM fixed-k | EB-JeWM |
+|---|---:|---:|---:|---:|
+| TwoRoom | 26.0±6.6 | 93.2±3.1 | 98.4±2.0 | 98.8±1.3 |
+| Push-T | 40.4±6.1 | 43.4±6.2 | 45.0±6.3 | 46.8±8.5 |
+| OGBench-Cube | 48.2±6.2 | 41.0±8.1 | 38.8±6.0 | 40.8±7.1 |
+| Reacher | 67.4±8.2 | 69.0±6.6 | 66.2±8.6 | 65.0±8.0 |
+
+TwoRoom is positive. Push-T shows a modest paired gain versus vanilla (`+6.4` points, bootstrap 95% `[+0.8,+12.0]`). Cube is negative versus vanilla (`-7.4` points, exact McNemar \(p=1.97e-06\)); EB-JeWM is not distinguishable from temp-dist or fixed-k controls. Reacher is negative/null relative to vanilla/temp-dist controls.
+
+## Citation
+
+```bibtex
+@inproceedings{placeholder_lewm_eb2026,
+  title={Event-Bottleneck Sub-Goal Planning with Termination Gating for Latent World Models},
+  author={Anonymous Authors},
+  booktitle={IEEE},
+  year={2026}
+}
+```
+
+Please also cite the upstream LeWM and stable-worldmodel projects:
+
+```bibtex
 @article{maes_lelidec2026lewm,
   title={LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
   author={Maes, Lucas and Le Lidec, Quentin and Scieur, Damien and LeCun, Yann and Balestriero, Randall},
@@ -26,159 +205,6 @@ If you find this code useful, please reference it in your paper:
 }
 ```
 
-## Using the code
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training. Together they reduce this repository to its core contribution: the model architecture and training objective.
-
-**Installation:**
-```bash
-uv venv --python=3.10
-source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
-```
-
-## Data
-
-Datasets use the HDF5 format for fast loading. Download the data from [HuggingFace](https://huggingface.co/collections/quentinll/lewm) and decompress with:
-
-```bash
-tar --zstd -xvf archive.tar.zst
-```
-
-Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-wm/`). You can override this path:
-```bash
-export STABLEWM_HOME=/path/to/your/storage
-```
-
-Dataset names are specified without the `.h5` extension. For example, `config/train/data/pusht.yaml` references `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
-
-## Training
-
-`jepa.py` contains the PyTorch implementation of LeWM. Training is configured via [Hydra](https://hydra.cc/) config files under `config/train/`.
-
-Before training, set your WandB `entity` and `project` in `config/train/lewm.yaml`:
-```yaml
-wandb:
-  config:
-    entity: your_entity
-    project: your_project
-```
-
-To launch training:
-```bash
-python train.py data=pusht
-```
-
-Checkpoints are saved to `$STABLEWM_HOME` upon completion.
-
-For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
-
-## Planning
-
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
-
-```bash
-# ✓ correct
-python eval.py --config-name=pusht.yaml policy=pusht/lewm
-
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
-```
-
-## Pretrained Checkpoints
-
-Pretrained LeWM checkpoints for each environment are mirrored on the Hugging Face
-Hub (model repos), alongside the datasets (dataset repos) in the same collection:
-
-- [`quentinll/lewm-pusht`](https://huggingface.co/quentinll/lewm-pusht)
-- [`quentinll/lewm-cube`](https://huggingface.co/quentinll/lewm-cube)
-- [`quentinll/lewm-tworooms`](https://huggingface.co/quentinll/lewm-tworooms)
-- [`quentinll/lewm-reacher`](https://huggingface.co/quentinll/lewm-reacher)
-
-The full baseline checkpoint suite (PLDM, LeJEPA, IVL, IQL, GCBC, DINO-WM, DINO-WM-noprop)
-is available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e):
-
-<div align="center">
-
-| Method | two-room | pusht | cube | reacher |
-|:---:|:---:|:---:|:---:|:---:|
-| pldm | ✓ | ✓ | ✓ | ✓ |
-| lejepa | ✓ | ✓ | ✓ | ✓ |
-| ivl | ✓ | ✓ | ✓ | — |
-| iql | ✓ | ✓ | ✓ | — |
-| gcbc | ✓ | ✓ | ✓ | — |
-| dinowm | ✓ | ✓ | — | — |
-| dinowm_noprop | ✓ | ✓ | ✓ | ✓ |
-
-</div>
-
-## Loading a checkpoint
-
-### From the Drive archive
-
-Each tar archive contains two files per checkpoint:
-- `<name>_object.ckpt` — a serialized Python object for convenient loading; this is what `eval.py` and the `stable_worldmodel` API use
-- `<name>_weight.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance
-
-Place the extracted files under `$STABLEWM_HOME/` and load via:
-
-```python
-import stable_worldmodel as swm
-
-# Load the cost model (for MPC)
-cost = swm.policy.AutoCostModel('pusht/lewm')
-```
-
-`AutoCostModel` accepts:
-- `run_name` — checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix
-- `cache_dir` — optional override for the checkpoint root (defaults to `$STABLEWM_HOME`)
-
-The returned module is in `eval` mode with its PyTorch weights accessible via `.state_dict()`.
-
-### From the Hugging Face mirror
-
-The HF model repos ship the LeWM checkpoint as a `weights.pt` (state dict) plus a
-`config.json` describing the model. Convert once to produce the `_object.ckpt`
-that `eval.py` expects:
-
-```bash
-# download weights.pt + config.json
-hf download quentinll/lewm-pusht --local-dir $STABLEWM_HOME/hf_pusht
-
-# convert to object checkpoint under $STABLEWM_HOME/pusht/lewm_object.ckpt
-python - <<'PY'
-import json, torch, stable_pretraining as spt
-from pathlib import Path
-from jepa import JEPA
-from module import ARPredictor, Embedder, MLP
-import stable_worldmodel as swm
-
-src = Path(swm.data.utils.get_cache_dir(), "hf_pusht")
-out = Path(swm.data.utils.get_cache_dir(), "pusht", "lewm_object.ckpt")
-
-cfg = json.loads((src / "config.json").read_text())
-encoder = spt.backbone.utils.vit_hf(
-    cfg["encoder"]["size"],
-    patch_size=cfg["encoder"]["patch_size"],
-    image_size=cfg["encoder"]["image_size"],
-    pretrained=False, use_mask_token=False,
-)
-mlp = lambda k: MLP(input_dim=cfg[k]["input_dim"], output_dim=cfg[k]["output_dim"],
-                    hidden_dim=cfg[k]["hidden_dim"], norm_fn=torch.nn.BatchNorm1d)
-model = JEPA(
-    encoder=encoder,
-    predictor=ARPredictor(**cfg["predictor"]),
-    action_encoder=Embedder(**cfg["action_encoder"]),
-    projector=mlp("projector"),
-    pred_proj=mlp("pred_proj"),
-)
-sd = torch.load(src / "weights.pt", map_location="cpu", weights_only=False)
-model.load_state_dict(sd, strict=True)
-out.parent.mkdir(parents=True, exist_ok=True)
-torch.save(model, out)
-PY
-```
-
-After conversion, load via `swm.policy.AutoCostModel('pusht/lewm')` as usual.
-
-## Contact & Contributions
-Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`
+- Upstream LeWM: https://github.com/lucas-maes/le-wm
+- stable-worldmodel: https://github.com/galilai-group/stable-worldmodel
+- stable-pretraining: https://github.com/galilai-group/stable-pretraining

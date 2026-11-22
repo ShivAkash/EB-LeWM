@@ -14,6 +14,9 @@ from sklearn import preprocessing
 from torchvision.transforms import v2 as transforms
 import stable_worldmodel as swm
 
+from eb_planner import EBHeads, EventDrivenPolicyWrapper, attach_custom_criterion, load_lewm_model
+
+
 def img_transform(cfg):
     transform = transforms.Compose(
         [
@@ -46,9 +49,10 @@ def get_dataset(cfg, dataset_name):
     )
     return dataset
 
+
 @hydra.main(version_base=None, config_path="./config/eval", config_name="pusht")
 def run(cfg: DictConfig):
-    """Run evaluation of dinowm vs random policy."""
+    """Run evaluation with strict train/val/test hygiene and runtime event-driven replanning."""
     assert (
         cfg.plan_config.horizon * cfg.plan_config.action_block <= cfg.eval.eval_budget
     ), "Planning horizon must be smaller than or equal to eval_budget"
@@ -64,7 +68,7 @@ def run(cfg: DictConfig):
     }
 
     dataset = get_dataset(cfg, cfg.eval.dataset_name)
-    stats_dataset = dataset  # get_dataset(cfg, cfg.dataset.stats)
+    stats_dataset = dataset
     col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
     ep_indices, _ = np.unique(stats_dataset.get_col_data(col_name), return_index=True)
 
@@ -83,18 +87,30 @@ def run(cfg: DictConfig):
 
     # -- run evaluation
     policy = cfg.get("policy", "random")
+    solver_mode = cfg.get("solver_mode", "vanilla")
 
     if policy != "random":
-        model = swm.wm.utils.load_pretrained(cfg.policy)
-        model = model.to("cuda")
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
+        model = load_lewm_model(cfg.policy, device="cuda")
+
+        if solver_mode != "vanilla":
+            heads_path = Path(
+                cfg.get(
+                    "eb_heads_path",
+                    Path(swm.data.utils.get_cache_dir(), cfg.policy).parent / "eb_heads.pt",
+                )
+            )
+            print(f"[EB-JeWM] Attaching solver_mode='{solver_mode}' with heads from {heads_path}")
+            heads = EBHeads(dim=192)
+            heads.load_state_dict(torch.load(heads_path, map_location="cpu", weights_only=True))
+            attach_custom_criterion(model, heads, mode=solver_mode)
+
         config = swm.PlanConfig(**cfg.plan_config)
         solver = hydra.utils.instantiate(cfg.solver, model=model)
-        policy = swm.policy.WorldModelPolicy(
+        base_policy = swm.policy.WorldModelPolicy(
             solver=solver, config=config, process=process, transform=transform
         )
+        # Wrap policy so runtime event termination flushes cached multi-step action plans
+        policy = EventDrivenPolicyWrapper(base_policy, model, mode=solver_mode)
 
     else:
         policy = swm.policy.RandomPolicy()
@@ -109,16 +125,18 @@ def run(cfg: DictConfig):
     episode_len = get_episodes_length(dataset, ep_indices)
     max_start_idx = episode_len - cfg.eval.goal_offset_steps - 1
     max_start_idx_dict = {ep_id: max_start_idx[i] for i, ep_id in enumerate(ep_indices)}
-    # Map each dataset row’s episode_idx to its max_start_idx
-    col_name = "episode_idx" if "episode_idx" in dataset.column_names else "ep_idx"
-    max_start_per_row = np.array(
-        [max_start_idx_dict[ep_id] for ep_id in dataset.get_col_data(col_name)]
-    )
+    ep_col_data = dataset.get_col_data(col_name)
+    max_start_per_row = np.array([max_start_idx_dict[ep_id] for ep_id in ep_col_data])
 
-    # remove all the lines of dataset for which dataset['step_idx'] > max_start_per_row
-    valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
+    # Restrict evaluation strictly to held-out Test Split (ep_id < 1000)
+    test_split_max_ep = cfg.get("test_split_max_ep", 1000)
+    if np.max(ep_indices) >= test_split_max_ep:
+        valid_mask = (dataset.get_col_data("step_idx") <= max_start_per_row) & (ep_col_data < test_split_max_ep)
+    else:
+        valid_mask = dataset.get_col_data("step_idx") <= max_start_per_row
+
     valid_indices = np.nonzero(valid_mask)[0]
-    print(valid_mask.sum(), "valid starting points found for evaluation.")
+    print(valid_mask.sum(), "valid held-out test starting points found for evaluation.")
 
     g = np.random.default_rng(cfg.seed)
     random_episode_indices = g.choice(
@@ -148,11 +166,13 @@ def run(cfg: DictConfig):
         eval_budget=cfg.eval.eval_budget,
         episodes_idx=eval_episodes.tolist(),
         callables=OmegaConf.to_container(cfg.eval.get("callables"), resolve=True),
-        video=results_path,
+        video=None,
     )
     end_time = time.time()
-    
+
+    wrapper_stats = getattr(policy, "stats", None)
     print(metrics)
+    print("wrapper stats:", wrapper_stats)
 
     results_path = results_path / cfg.output.filename
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,6 +186,7 @@ def run(cfg: DictConfig):
 
         f.write("==== RESULTS ====\n")
         f.write(f"metrics: {metrics}\n")
+        f.write(f"wrapper_stats: {wrapper_stats}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
 
