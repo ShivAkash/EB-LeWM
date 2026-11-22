@@ -188,8 +188,7 @@ TwoRoom is positive. Push-T shows a modest paired gain versus vanilla (`+6.4` po
 ```bibtex
 @inproceedings{placeholder_lewm_eb2026,
   title={Event-Bottleneck Sub-Goal Planning with Termination Gating for Latent World Models},
-  author={Anonymous Authors},
-  booktitle={IEEE},
+  author={Shiv Akash S M},
   year={2026}
 }
 ```
